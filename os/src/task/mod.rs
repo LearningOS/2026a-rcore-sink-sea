@@ -133,6 +133,26 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Record a syscall made by the current task.
+    fn increment_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].increment_syscall_count(syscall_id);
+    }
+
+    /// Return the current task's count for a syscall.
+    fn syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task].syscall_count(syscall_id)
+    }
+
+    /// Mutably access the current task's address space.
+    fn with_current_memory_set<T>(&self, f: impl FnOnce(&mut crate::mm::MemorySet) -> T) -> T {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        f(&mut inner.tasks[current].memory_set)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +221,19 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Record a syscall made by the current task.
+pub fn increment_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.increment_syscall_count(syscall_id);
+}
+
+/// Return the current task's count for a syscall.
+pub fn syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.syscall_count(syscall_id)
+}
+
+/// Mutably access the current task's address space.
+pub fn with_current_memory_set<T>(f: impl FnOnce(&mut crate::mm::MemorySet) -> T) -> T {
+    TASK_MANAGER.with_current_memory_set(f)
 }

@@ -262,6 +262,75 @@ impl MemorySet {
             false
         }
     }
+
+    /// Map a new framed user-memory area when the entire range is unused.
+    pub fn mmap(&mut self, start: usize, len: usize, permission: MapPermission) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if len == 0
+            || start % PAGE_SIZE != 0
+            || usize::from(VirtAddr::from(start)) != start
+            || usize::from(VirtAddr::from(end - 1)) != end - 1
+        {
+            return false;
+        }
+        let start_va = VirtAddr::from(start);
+        let end_va = VirtAddr::from(end);
+        let range = VPNRange::new(start_va.floor(), end_va.ceil());
+        if range.into_iter().any(|vpn| {
+            self.page_table
+                .translate(vpn)
+                .map_or(false, |pte| pte.is_valid())
+        }) {
+            return false;
+        }
+        self.push(
+            MapArea::new(
+                start_va,
+                end_va,
+                MapType::Framed,
+                permission | MapPermission::U,
+            ),
+            None,
+        );
+        true
+    }
+
+    /// Unmap a user-memory range when every covered page is currently mapped.
+    pub fn munmap(&mut self, start: usize, len: usize) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if len == 0
+            || start % PAGE_SIZE != 0
+            || usize::from(VirtAddr::from(start)) != start
+            || usize::from(VirtAddr::from(end - 1)) != end - 1
+        {
+            return false;
+        }
+        let range = VPNRange::new(VirtAddr::from(start).floor(), VirtAddr::from(end).ceil());
+        if range.into_iter().any(|vpn| {
+            self.page_table.translate(vpn).map_or(true, |pte| {
+                !pte.is_valid() || !pte.flags().contains(PTEFlags::U)
+            })
+        }) {
+            return false;
+        }
+        for vpn in range {
+            if let Some(area) = self
+                .areas
+                .iter_mut()
+                .rev()
+                .find(|area| area.contains_frame(vpn))
+            {
+                area.unmap_one(&mut self.page_table, vpn);
+            } else {
+                self.page_table.unmap(vpn);
+            }
+        }
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -272,6 +341,10 @@ pub struct MapArea {
 }
 
 impl MapArea {
+    fn contains_frame(&self, vpn: VirtPageNum) -> bool {
+        self.map_type == MapType::Framed && self.data_frames.contains_key(&vpn)
+    }
+
     pub fn new(
         start_va: VirtAddr,
         end_va: VirtAddr,

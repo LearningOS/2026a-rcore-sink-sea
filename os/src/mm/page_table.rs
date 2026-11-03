@@ -179,3 +179,47 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     }
     v
 }
+
+/// Translate a user buffer after checking that every page has the requested permission.
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    if usize::from(VirtAddr::from(start)) != start
+        || (len > 0 && usize::from(VirtAddr::from(end - 1)) != end - 1)
+    {
+        return None;
+    }
+    let mut buffers = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        let flags = pte.flags();
+        if !pte.is_valid()
+            || !flags.contains(PTEFlags::U)
+            || if write {
+                !flags.contains(PTEFlags::W)
+            } else {
+                !flags.contains(PTEFlags::R)
+            }
+        {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let page_end = usize::from(VirtAddr::from(vpn));
+        let buffer_end = end.min(page_end);
+        buffers.push(
+            &mut ppn.get_bytes_array()
+                [start_va.page_offset()..start_va.page_offset() + buffer_end - start],
+        );
+        start = buffer_end;
+    }
+    Some(buffers)
+}
