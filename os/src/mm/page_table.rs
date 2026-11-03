@@ -179,6 +179,46 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     v
 }
 
+/// Translate a user buffer after checking every page's user and access permissions.
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = ptr as usize;
+    let end = start.checked_add(len)?;
+    if usize::from(VirtAddr::from(start)) != start
+        || (len > 0 && usize::from(VirtAddr::from(end - 1)) != end - 1)
+    {
+        return None;
+    }
+    let mut buffers = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        let flags = pte.flags();
+        let permitted = if write {
+            flags.contains(PTEFlags::W)
+        } else {
+            flags.contains(PTEFlags::R)
+        };
+        if !pte.is_valid() || !flags.contains(PTEFlags::U) || !permitted {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let page_end = usize::from(VirtAddr::from(vpn));
+        let buffer_end = end.min(page_end);
+        let offset = start_va.page_offset();
+        buffers.push(&mut ppn.get_bytes_array()[offset..offset + buffer_end - start]);
+        start = buffer_end;
+    }
+    Some(buffers)
+}
+
 /// Create String in kernel address space from u8 Array(end with 0) in other address space
 pub fn translated_str(token: usize, ptr: *const u8) -> String {
     let page_table = PageTable::from_token(token);

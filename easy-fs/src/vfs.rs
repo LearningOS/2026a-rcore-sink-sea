@@ -85,6 +85,122 @@ impl Inode {
             })
         })
     }
+    /// Return this inode's filesystem-wide identifier.
+    pub fn inode_id(&self) -> u32 {
+        self.fs
+            .lock()
+            .get_inode_id(self.block_id, self.block_offset)
+    }
+    /// Count directory entries that refer to this inode.
+    pub fn nlink(&self) -> u32 {
+        let inode_id = self.inode_id();
+        let fs = self.fs.lock();
+        let (block_id, block_offset) = fs.get_disk_inode_pos(0);
+        let root = Self::new(
+            block_id,
+            block_offset,
+            self.fs.clone(),
+            self.block_device.clone(),
+        );
+        root.read_disk_inode(|disk_inode| {
+            let file_count = disk_inode.size as usize / DIRENT_SZ;
+            let mut count = 0;
+            for index in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    disk_inode.read_at(
+                        index * DIRENT_SZ,
+                        dirent.as_bytes_mut(),
+                        &self.block_device,
+                    ),
+                    DIRENT_SZ,
+                );
+                if dirent.inode_id() == inode_id {
+                    count += 1;
+                }
+            }
+            count
+        })
+    }
+    /// Create a new directory entry that refers to an existing inode.
+    pub fn link(&self, old_name: &str, new_name: &str) -> bool {
+        let mut fs = self.fs.lock();
+        let inode_id = self.read_disk_inode(|disk_inode| {
+            if self.find_inode_id(new_name, disk_inode).is_some() {
+                None
+            } else {
+                self.find_inode_id(old_name, disk_inode)
+            }
+        });
+        let Some(inode_id) = inode_id else {
+            return false;
+        };
+        self.modify_disk_inode(|root_inode| {
+            let file_count = root_inode.size as usize / DIRENT_SZ;
+            let new_size = (file_count + 1) * DIRENT_SZ;
+            self.increase_size(new_size as u32, root_inode, &mut fs);
+            let dirent = DirEntry::new(new_name, inode_id);
+            assert_eq!(
+                root_inode.write_at(
+                    file_count * DIRENT_SZ,
+                    dirent.as_bytes(),
+                    &self.block_device,
+                ),
+                DIRENT_SZ,
+            );
+        });
+        drop(fs);
+        block_cache_sync_all();
+        true
+    }
+    /// Remove a directory entry without reclaiming the referenced inode.
+    pub fn unlink(&self, name: &str) -> bool {
+        let fs = self.fs.lock();
+        let removed = self.modify_disk_inode(|root_inode| {
+            let file_count = root_inode.size as usize / DIRENT_SZ;
+            let mut found = None;
+            for index in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    root_inode.read_at(
+                        index * DIRENT_SZ,
+                        dirent.as_bytes_mut(),
+                        &self.block_device,
+                    ),
+                    DIRENT_SZ,
+                );
+                if dirent.name() == name {
+                    found = Some(index);
+                    break;
+                }
+            }
+            let Some(index) = found else {
+                return false;
+            };
+            if index + 1 < file_count {
+                let mut last = DirEntry::empty();
+                assert_eq!(
+                    root_inode.read_at(
+                        (file_count - 1) * DIRENT_SZ,
+                        last.as_bytes_mut(),
+                        &self.block_device,
+                    ),
+                    DIRENT_SZ,
+                );
+                assert_eq!(
+                    root_inode.write_at(index * DIRENT_SZ, last.as_bytes(), &self.block_device,),
+                    DIRENT_SZ,
+                );
+            }
+            root_inode.size -= DIRENT_SZ as u32;
+            true
+        });
+        drop(fs);
+        if removed {
+            block_cache_sync_all();
+        }
+        removed
+    }
     /// increase the size of file( also known as 'disk inode')
     fn increase_size(
         &self,

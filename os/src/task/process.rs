@@ -49,6 +49,173 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Per-process deadlock detector for mutexes and semaphores.
+    pub deadlock_detector: DeadlockDetector,
+}
+
+/// Deadlock state for the two independent resource classes.
+pub struct DeadlockDetector {
+    /// Whether unsafe requests should be rejected.
+    pub enabled: bool,
+    mutexes: ResourceTracker,
+    semaphores: ResourceTracker,
+}
+
+/// Available resources and the current allocation/request matrices.
+struct ResourceTracker {
+    available: Vec<usize>,
+    allocation: Vec<Vec<usize>>,
+    need: Vec<Vec<usize>>,
+}
+
+impl ResourceTracker {
+    fn new() -> Self {
+        Self {
+            available: Vec::new(),
+            allocation: Vec::new(),
+            need: Vec::new(),
+        }
+    }
+
+    fn ensure_thread(&mut self, tid: usize) {
+        while self.allocation.len() <= tid {
+            self.allocation.push(vec![0; self.available.len()]);
+            self.need.push(vec![0; self.available.len()]);
+        }
+    }
+
+    fn reset_thread(&mut self, tid: usize) {
+        self.ensure_thread(tid);
+        self.allocation[tid].fill(0);
+        self.need[tid].fill(0);
+    }
+
+    fn add_resource(&mut self, id: usize, count: usize) {
+        while self.available.len() <= id {
+            self.available.push(0);
+            for row in self.allocation.iter_mut() {
+                row.push(0);
+            }
+            for row in self.need.iter_mut() {
+                row.push(0);
+            }
+        }
+        self.available[id] = count;
+        for row in self.allocation.iter_mut() {
+            row[id] = 0;
+        }
+        for row in self.need.iter_mut() {
+            row[id] = 0;
+        }
+    }
+
+    fn request(&mut self, tid: usize, id: usize, detect: bool) -> bool {
+        self.ensure_thread(tid);
+        self.need[tid][id] += 1;
+        if detect && self.is_deadlocked() {
+            self.need[tid][id] -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn allocate(&mut self, tid: usize, id: usize) {
+        self.ensure_thread(tid);
+        self.need[tid][id] -= 1;
+        self.allocation[tid][id] += 1;
+        self.available[id] -= 1;
+    }
+
+    fn release(&mut self, tid: usize, id: usize) {
+        self.ensure_thread(tid);
+        if self.allocation[tid][id] > 0 {
+            self.allocation[tid][id] -= 1;
+        }
+        self.available[id] += 1;
+    }
+
+    fn is_deadlocked(&self) -> bool {
+        let mut work = self.available.clone();
+        let mut finish = vec![false; self.allocation.len()];
+        loop {
+            let mut found = false;
+            for tid in 0..finish.len() {
+                if !finish[tid]
+                    && self.need[tid]
+                        .iter()
+                        .zip(work.iter())
+                        .all(|(need, available)| need <= available)
+                {
+                    for (available, allocated) in work.iter_mut().zip(self.allocation[tid].iter()) {
+                        *available += allocated;
+                    }
+                    finish[tid] = true;
+                    found = true;
+                }
+            }
+            if !found {
+                break;
+            }
+        }
+        finish.iter().any(|finished| !finished)
+    }
+}
+
+impl DeadlockDetector {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            mutexes: ResourceTracker::new(),
+            semaphores: ResourceTracker::new(),
+        }
+    }
+
+    /// Clear bookkeeping when a thread id is first allocated or reused.
+    pub fn reset_thread(&mut self, tid: usize) {
+        self.mutexes.reset_thread(tid);
+        self.semaphores.reset_thread(tid);
+    }
+
+    /// Register a newly-created mutex.
+    pub fn add_mutex(&mut self, id: usize) {
+        self.mutexes.add_resource(id, 1);
+    }
+
+    /// Register a newly-created semaphore.
+    pub fn add_semaphore(&mut self, id: usize, count: usize) {
+        self.semaphores.add_resource(id, count);
+    }
+
+    /// Record a mutex request and reject it if it makes the state unsafe.
+    pub fn request_mutex(&mut self, tid: usize, id: usize) -> bool {
+        self.mutexes.request(tid, id, self.enabled)
+    }
+
+    /// Record a completed mutex acquisition.
+    pub fn allocate_mutex(&mut self, tid: usize, id: usize) {
+        self.mutexes.allocate(tid, id);
+    }
+
+    /// Record a mutex release.
+    pub fn release_mutex(&mut self, tid: usize, id: usize) {
+        self.mutexes.release(tid, id);
+    }
+
+    /// Record a semaphore request and reject it if it makes the state unsafe.
+    pub fn request_semaphore(&mut self, tid: usize, id: usize) -> bool {
+        self.semaphores.request(tid, id, self.enabled)
+    }
+
+    /// Record a completed semaphore acquisition.
+    pub fn allocate_semaphore(&mut self, tid: usize, id: usize) {
+        self.semaphores.allocate(tid, id);
+    }
+
+    /// Record a semaphore release.
+    pub fn release_semaphore(&mut self, tid: usize, id: usize) {
+        self.semaphores.release(tid, id);
+    }
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +286,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detector: DeadlockDetector::new(),
                 })
             },
         });
@@ -245,6 +413,7 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detector: DeadlockDetector::new(),
                 })
             },
         });
@@ -276,6 +445,23 @@ impl ProcessControlBlock {
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
         // add this thread to scheduler
         add_task(task);
+        child
+    }
+    /// Create a child process directly from an executable image.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let child = Self::new(elf_data);
+        let fd_table = self
+            .inner_exclusive_access()
+            .fd_table
+            .iter()
+            .map(|fd| fd.as_ref().map(Arc::clone))
+            .collect();
+        {
+            let mut child_inner = child.inner_exclusive_access();
+            child_inner.parent = Some(Arc::downgrade(self));
+            child_inner.fd_table = fd_table;
+        }
+        self.inner_exclusive_access().children.push(child.clone());
         child
     }
     /// get pid
