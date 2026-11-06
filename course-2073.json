@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-sink-sea",
+  "user": "sink-sea",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "d1d73b592d4574226b491c7f27b7dc682325b6d6"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "42212537359",
+    "runAttempt": "1"
+  }
+}
